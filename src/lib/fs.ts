@@ -590,3 +590,39 @@ export function runCommand(prev: FsState, input: string): CmdResult {
   }
   return result
 }
+/* ------------------------------ sessão inicial ------------------------------ */
+
+export function createInitialSession(): { fs: FsState; history: HistoryEntry[] } {
+  let fs = createFs()
+  const setup = [
+    'mkdir home etc var tmp usr',
+    'mkdir -p home/usuario',
+    'touch home/usuario/notas.txt 12',
+    'touch etc/hosts 2',
+    'touch var/app.log 48',
+    'touch tmp/cache.bin 6',
+  ]
+  for (const c of setup) fs = runCommand(fs, c).fs
+  const visible = [
+    'cd /home/usuario',
+    'mkdir projetos',
+    'cd projetos',
+    'touch README.md 8',
+    'touch main.c 24',
+    'touch temp.txt 4',
+    'ls',
+    'rm temp.txt',
+  ]
+  const history: HistoryEntry[] = [
+    {
+      id: 0,
+      lines: [dim("memfs 1.0 · árvore N-ária em memória · digite 'help' para ver os comandos")],
+    },
+  ]
+  visible.forEach((cmd, i) => {
+    const r = runCommand(fs, cmd)
+    fs = r.fs
+    history.push({ id: i + 1, cmd, lines: r.lines })
+  })
+  return { fs, history }
+}
