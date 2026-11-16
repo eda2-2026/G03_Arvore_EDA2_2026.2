@@ -1,4 +1,4 @@
-/ Sistema de arquivos em memória modelado como uma árvore N-ária.
+// Sistema de arquivos em memória modelado como uma árvore N-ária. 
 // Cada nó guarda um "ponteiro" (id), o ponteiro do pai e um array de ponteiros filhos.
 
 export type NodeType = 'dir' | 'file'
