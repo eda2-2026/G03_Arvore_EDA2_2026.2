@@ -1,5 +1,13 @@
-/ Sistema de arquivos em memória modelado como uma árvore N-ária.
-// Cada nó guarda um "ponteiro" (id), o ponteiro do pai e um array de ponteiros filhos.
+import {
+  avlHeight,
+  avlInOrder,
+  avlInsert,
+  avlRemove,
+  avlSearch,
+  balanceFactor,
+  type AvlNode,
+  type RotationEvent,
+} from './avl'
 
 export type NodeType = 'dir' | 'file'
 
