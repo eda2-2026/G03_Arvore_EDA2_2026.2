@@ -1,5 +1,13 @@
-/ Sistema de arquivos em memória modelado como uma árvore N-ária.
-// Cada nó guarda um "ponteiro" (id), o ponteiro do pai e um array de ponteiros filhos.
+import {
+  avlHeight,
+  avlInOrder,
+  avlInsert,
+  avlRemove,
+  avlSearch,
+  balanceFactor,
+  type AvlNode,
+  type RotationEvent,
+} from './avl'
 
 export type NodeType = 'dir' | 'file'
 
@@ -7,9 +15,23 @@ export interface FsNode {
   id: string
   name: string
   type: NodeType
+
+  // Pai na hierarquia de diretórios, não na AVL.
   parent: string | null
-  children: string[]
-  size: number // KB (apenas arquivos)
+
+  // Raiz da AVL das entradas deste diretório.
+  // Arquivos possuem entries = null.
+  entries: AvlNode | null
+
+  // Compatibilidade com os componentes existentes.
+  // É calculado a partir da AVL, não armazenado em paralelo.
+  readonly children: string[]
+
+  size: number
+}
+
+export interface FsRotation extends RotationEvent {
+  directoryId: string
 }
 
 export interface FsState {
@@ -17,13 +39,23 @@ export interface FsState {
   root: string
   cwd: string
   counter: number
+  avlEvents: FsRotation[]
 }
 
-export type Tone = 'dir' | 'file' | 'err' | 'ok' | 'dim' | 'warn' | 'accent'
+export type Tone =
+  | 'dir'
+  | 'file'
+  | 'err'
+  | 'ok'
+  | 'dim'
+  | 'warn'
+  | 'accent'
+
 export interface Seg {
   text: string
   tone?: Tone
 }
+
 export type Line = Seg[]
 
 export interface CmdResult {
@@ -40,7 +72,9 @@ export interface HistoryEntry {
   lines: Line[]
 }
 
+// Estimativa didática; não representa consumo real de memória do JavaScript.
 export const NODE_OVERHEAD_KB = 2
+
 export const COMMANDS = [
   'help',
   'pwd',
@@ -55,50 +89,96 @@ export const COMMANDS = [
   'stat',
   'clear',
 ]
-/* ------------------------------ helpers ------------------------------ */
 
-export const makeId = (n: number) => '0x' + (0x7f3a01c0 + n * 0x48).toString(16)
+export const makeId = (n: number) =>
+  '0x' + (0x7f3a01c0 + n * 0x48).toString(16)
+
+function makeFsNode(data: Omit<FsNode, 'children'>): FsNode {
+  return {
+    ...data,
+
+    get children(): string[] {
+      return avlInOrder(this.entries).map((entry) => entry.value)
+    },
+  }
+}
 
 export function createFs(): FsState {
   const rootId = makeId(0)
+
   return {
     nodes: {
-      [rootId]: { id: rootId, name: '/', type: 'dir', parent: null, children: [], size: 0 },
+      [rootId]: makeFsNode({
+        id: rootId,
+        name: '/',
+        type: 'dir',
+        parent: null,
+        entries: null,
+        size: 0,
+      }),
     },
     root: rootId,
     cwd: rootId,
     counter: 1,
+    avlEvents: [],
   }
 }
 
 function cloneFs(fs: FsState): FsState {
   const nodes: Record<string, FsNode> = {}
-  for (const k of Object.keys(fs.nodes)) nodes[k] = { ...fs.nodes[k], children: [...fs.nodes[k].children] }
-  return { ...fs, nodes }
+
+  for (const id of Object.keys(fs.nodes)) {
+    const current = fs.nodes[id]
+
+    nodes[id] = makeFsNode({
+      id: current.id,
+      name: current.name,
+      type: current.type,
+      parent: current.parent,
+      size: current.size,
+      entries: current.entries,
+    })
+  }
+
+  // As AVL são imutáveis e podem compartilhar subárvores entre estados.
+  return {
+    ...fs,
+    nodes,
+    avlEvents: [],
+  }
+}
+
+export function childrenOf(fs: FsState, id: string): string[] {
+  return fs.nodes[id]?.children ?? []
 }
 
 export function pathOf(fs: FsState, id: string): string {
   const parts: string[] = []
-  let cur: FsNode | undefined = fs.nodes[id]
-  while (cur && cur.parent) {
-    parts.unshift(cur.name)
-    cur = fs.nodes[cur.parent]
+  let current: FsNode | undefined = fs.nodes[id]
+
+  while (current && current.parent) {
+    parts.unshift(current.name)
+    current = fs.nodes[current.parent]
   }
+
   return '/' + parts.join('/')
 }
 
-/** Ids da raiz até o nó (inclusive). */
 export function ancestors(fs: FsState, id: string): string[] {
-  const out: string[] = []
-  let cur: FsNode | undefined = fs.nodes[id]
-  while (cur) {
-    out.unshift(cur.id)
-    cur = cur.parent ? fs.nodes[cur.parent] : undefined
+  const result: string[] = []
+  let current: FsNode | undefined = fs.nodes[id]
+
+  while (current) {
+    result.unshift(current.id)
+    current = current.parent
+      ? fs.nodes[current.parent]
+      : undefined
   }
-  return out
+
+  return result
 }
 
-export function depthOf(fs: FsState, id: string) {
+export function depthOf(fs: FsState, id: string): number {
   return ancestors(fs, id).length - 1
 }
 
@@ -107,117 +187,238 @@ function homeId(fs: FsState): string | null {
 }
 
 export function promptPath(fs: FsState): string {
-  const p = pathOf(fs, fs.cwd)
+  const currentPath = pathOf(fs, fs.cwd)
   const home = homeId(fs)
+
   if (home) {
-    const hp = pathOf(fs, home)
-    if (p === hp) return '~'
-    if (p.startsWith(hp + '/')) return '~' + p.slice(hp.length)
+    const homePath = pathOf(fs, home)
+
+    if (currentPath === homePath) return '~'
+
+    if (currentPath.startsWith(homePath + '/')) {
+      return '~' + currentPath.slice(homePath.length)
+    }
   }
-  return p
+
+  return currentPath
 }
 
-export function childByName(fs: FsState, dirId: string, name: string): string | null {
-  const d = fs.nodes[dirId]
-  if (!d) return null
-  return d.children.find((c) => fs.nodes[c].name === name) ?? null
+export function childByName(
+  fs: FsState,
+  dirId: string,
+  name: string,
+): string | null {
+  const directory = fs.nodes[dirId]
+
+  if (!directory || directory.type !== 'dir') return null
+
+  return avlSearch(directory.entries, name)?.value ?? null
 }
 
-export function resolve(fs: FsState, path: string, from: string = fs.cwd): string | null {
-  let cur: string
-  let p = path
-  if (p === '~' || p.startsWith('~/')) {
-    const h = homeId(fs)
-    cur = h ?? fs.root
-    p = p.slice(1)
-  } else if (p.startsWith('/')) cur = fs.root
-  else cur = from
-  for (const part of p.split('/')) {
+export function resolve(
+  fs: FsState,
+  path: string,
+  from: string = fs.cwd,
+): string | null {
+  let current: string
+  let remaining = path
+
+  if (remaining === '~' || remaining.startsWith('~/')) {
+    current = homeId(fs) ?? fs.root
+    remaining = remaining.slice(1)
+  } else {
+    current = remaining.startsWith('/') ? fs.root : from
+  }
+
+  for (const part of remaining.split('/')) {
     if (!part || part === '.') continue
-    const node = fs.nodes[cur]
-    if (node.type !== 'dir') return null
+
+    const node = fs.nodes[current]
+
+    if (!node || node.type !== 'dir') return null
+
     if (part === '..') {
-      cur = node.parent ?? cur
+      current = node.parent ?? current
       continue
     }
-    const next = childByName(fs, cur, part)
+
+    const next = childByName(fs, current, part)
+
     if (!next) return null
-    cur = next
+
+    current = next
   }
-  return cur
+
+  return fs.nodes[current] ? current : null
 }
 
-function splitPath(p: string): { dir: string; base: string } {
-  let s = p
-  while (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1)
-  const i = s.lastIndexOf('/')
-  if (i === -1) return { dir: '', base: s }
-  if (i === 0) return { dir: '/', base: s.slice(1) }
-  return { dir: s.slice(0, i), base: s.slice(i + 1) }
+function splitPath(path: string): { dir: string; base: string } {
+  let value = path
+
+  while (value.length > 1 && value.endsWith('/')) {
+    value = value.slice(0, -1)
+  }
+
+  const index = value.lastIndexOf('/')
+
+  if (index === -1) return { dir: '', base: value }
+  if (index === 0) return { dir: '/', base: value.slice(1) }
+
+  return {
+    dir: value.slice(0, index),
+    base: value.slice(index + 1),
+  }
 }
 
 export function validateName(name: string): string | null {
   if (!name) return 'O nome não pode ser vazio'
   if (name === '.' || name === '..') return 'Nome reservado'
-  if (/[\/"']/.test(name)) return "O nome não pode conter / ' ou \""
+  if (/[\/"']/.test(name)) return `O nome não pode conter /, ' ou "`
   if (name.length > 48) return 'Máximo de 48 caracteres'
+
   return null
 }
 
-export function validateNewName(fs: FsState, parentId: string, name: string): string | null {
-  const v = validateName(name)
-  if (v) return v
-  if (childByName(fs, parentId, name)) return `"${name}" já existe neste diretório`
+export function validateNewName(
+  fs: FsState,
+  parentId: string,
+  name: string,
+): string | null {
+  if (fs.nodes[parentId]?.type !== 'dir') {
+    return 'Destino não é um diretório'
+  }
+
+  const error = validateName(name)
+
+  if (error) return error
+
+  if (childByName(fs, parentId, name)) {
+    return `"${name}" já existe neste diretório`
+  }
+
   return null
 }
 
-function isAncestor(fs: FsState, anc: string, id: string) {
-  return ancestors(fs, id).includes(anc)
+function insertEntry(
+  fs: FsState,
+  directoryId: string,
+  name: string,
+  id: string,
+): void {
+  const events: RotationEvent[] = []
+  const directory = fs.nodes[directoryId]
+
+  directory.entries = avlInsert(
+    directory.entries,
+    name,
+    id,
+    events,
+  )
+
+  fs.avlEvents.push(
+    ...events.map((event) => ({ ...event, directoryId })),
+  )
 }
 
-function addNode(fs: FsState, parentId: string, name: string, type: NodeType, size = 0): string {
+function removeEntry(
+  fs: FsState,
+  directoryId: string,
+  name: string,
+): void {
+  const events: RotationEvent[] = []
+  const directory = fs.nodes[directoryId]
+
+  directory.entries = avlRemove(directory.entries, name, events)
+
+  fs.avlEvents.push(
+    ...events.map((event) => ({ ...event, directoryId })),
+  )
+}
+
+function addNode(
+  fs: FsState,
+  parentId: string,
+  name: string,
+  type: NodeType,
+  size = 0,
+): string {
   const id = makeId(fs.counter++)
-  fs.nodes[id] = { id, name, type, parent: parentId, children: [], size: type === 'file' ? size : 0 }
-  fs.nodes[parentId].children.push(id)
+
+  fs.nodes[id] = makeFsNode({
+    id,
+    name,
+    type,
+    parent: parentId,
+    entries: null,
+    size: type === 'file' ? size : 0,
+  })
+
+  insertEntry(fs, parentId, name, id)
+
   return id
 }
 
-function removeSubtree(fs: FsState, id: string): { count: number; kb: number } {
+function removeSubtree(
+  fs: FsState,
+  id: string,
+): { count: number; kb: number } {
   const node = fs.nodes[id]
   const parent = node.parent ? fs.nodes[node.parent] : null
-  if (parent) parent.children = parent.children.filter((c) => c !== id)
-  let count = 0
-  let kb = 0
+
+  if (parent) removeEntry(fs, parent.id, node.name)
+
   const stack = [id]
-  const gone = new Set<string>()
+  const removed = new Set<string>()
+  let kb = 0
+
   while (stack.length) {
-    const cur = stack.pop()!
-    gone.add(cur)
-    stack.push(...fs.nodes[cur].children)
+    const current = stack.pop()!
+
+    if (removed.has(current)) continue
+
+    removed.add(current)
+    stack.push(...childrenOf(fs, current))
   }
-  for (const g of gone) {
-    count++
-    kb += fs.nodes[g].size + NODE_OVERHEAD_KB
-    delete fs.nodes[g]
+
+  for (const current of removed) {
+    kb += fs.nodes[current].size + NODE_OVERHEAD_KB
+    delete fs.nodes[current]
   }
-  if (gone.has(fs.cwd)) fs.cwd = parent ? parent.id : fs.root
-  return { count, kb }
+
+  if (removed.has(fs.cwd)) {
+    fs.cwd = parent?.id ?? fs.root
+  }
+
+  return { count: removed.size, kb }
 }
 
-export function listDfs(fs: FsState, from: string = fs.root): string[] {
-  const out: string[] = []
-  const walk = (id: string) => {
-    out.push(id)
-    fs.nodes[id].children.forEach(walk)
+export function listDfs(
+  fs: FsState,
+  from: string = fs.root,
+): string[] {
+  const result: string[] = []
+
+  function visit(id: string): void {
+    if (!fs.nodes[id]) return
+
+    result.push(id)
+    childrenOf(fs, id).forEach(visit)
   }
-  walk(from)
-  return out
+
+  visit(from)
+  return result
 }
 
 export function findNodes(fs: FsState, term: string): string[] {
-  const t = term.trim().toLowerCase()
-  if (!t) return []
-  return listDfs(fs).filter((id) => id !== fs.root && fs.nodes[id].name.toLowerCase().includes(t))
+  const search = term.trim().toLowerCase()
+
+  if (!search) return []
+
+  return listDfs(fs).filter(
+    (id) =>
+      id !== fs.root &&
+      fs.nodes[id].name.toLowerCase().includes(search),
+  )
 }
 
 export function computeStats(fs: FsState) {
@@ -225,375 +426,584 @@ export function computeStats(fs: FsState) {
   let height = 0
   let maxDegree = 0
   let files = 0
-  let kb = 0
-  const walk = (id: string, d: number) => {
-    const n = fs.nodes[id]
+  let memoryKb = 0
+
+  function visit(id: string, depth: number): void {
+    const node = fs.nodes[id]
+    const children = childrenOf(fs, id)
+
     total++
-    height = Math.max(height, d)
-    maxDegree = Math.max(maxDegree, n.children.length)
-    kb += NODE_OVERHEAD_KB + n.size
-    if (n.type === 'file') files++
-    n.children.forEach((c) => walk(c, d + 1))
+    height = Math.max(height, depth)
+    maxDegree = Math.max(maxDegree, children.length)
+    memoryKb += NODE_OVERHEAD_KB + node.size
+
+    if (node.type === 'file') files++
+
+    children.forEach((child) => visit(child, depth + 1))
   }
-  walk(fs.root, 0)
-  return { total, height, maxDegree, memoryKb: kb, files, dirs: total - files }
+
+  visit(fs.root, 0)
+
+  return {
+    total,
+    height,
+    maxDegree,
+    memoryKb,
+    files,
+    dirs: total - files,
+  }
 }
 
-export function formatKb(kb: number) {
-  return kb >= 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${kb} KB`
+export function formatKb(kb: number): string {
+  return kb >= 1024
+    ? `${(kb / 1024).toFixed(1)} MB`
+    : `${kb} KB`
 }
 
 export function fileKind(name: string): 'code' | 'text' | 'other' {
-  if (/\.(c|h|cpp|ts|tsx|js|jsx|py|rs|go|java|sh|json)$/i.test(name)) return 'code'
-  if (/\.(md|txt|log|conf)$/i.test(name) || name === 'hosts') return 'text'
+  if (/\.(c|h|cpp|ts|tsx|js|jsx|py|rs|go|java|sh|json)$/i.test(name)) {
+    return 'code'
+  }
+
+  if (/\.(md|txt|log|conf)$/i.test(name) || name === 'hosts') {
+    return 'text'
+  }
+
   return 'other'
 }
-
-/* ------------------------------ comandos ------------------------------ */
 
 const err = (text: string): Line => [{ text, tone: 'err' }]
 const dim = (text: string): Line => [{ text, tone: 'dim' }]
 
 function tokenize(input: string): string[] {
-  const out: string[] = []
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(input))) out.push(m[1] ?? m[2] ?? m[3])
-  return out
+  const result: string[] = []
+  const expression = /"([^"]*)"|'([^']*)'|(\S+)/g
+  let match: RegExpExecArray | null
+
+  while ((match = expression.exec(input))) {
+    result.push(match[1] ?? match[2] ?? match[3])
+  }
+
+  return result
 }
 
-function expandTargets(fs: FsState, arg: string): string[] {
-  const { dir, base } = splitPath(arg)
+function expandTargets(fs: FsState, path: string): string[] {
+  const { dir, base } = splitPath(path)
+
   if (base === '*') {
-    const d = dir === '' ? fs.cwd : resolve(fs, dir)
-    if (!d || fs.nodes[d].type !== 'dir') return []
-    return [...fs.nodes[d].children]
+    const directoryId = dir === '' ? fs.cwd : resolve(fs, dir)
+
+    if (!directoryId || fs.nodes[directoryId].type !== 'dir') {
+      return []
+    }
+
+    return childrenOf(fs, directoryId)
   }
-  const r = resolve(fs, arg)
-  return r ? [r] : []
+
+  const id = resolve(fs, path)
+  return id ? [id] : []
 }
 
 function createAt(
   fs: FsState,
-  arg: string,
+  path: string,
   type: NodeType,
   size: number,
   parents: boolean,
-  cmd: string,
 ): { id?: string; error?: string } {
   if (parents && type === 'dir') {
-    let cur = arg.startsWith('/') ? fs.root : fs.cwd
-    let created: string | undefined
-    for (const part of arg.split('/').filter(Boolean)) {
+    const tilde = path === '~' || path.startsWith('~/')
+
+    let current = tilde
+      ? (homeId(fs) ?? fs.root)
+      : path.startsWith('/')
+        ? fs.root
+        : fs.cwd
+
+    const remaining = tilde ? path.slice(1) : path
+
+    for (const part of remaining.split('/').filter(Boolean)) {
       if (part === '.') continue
+
       if (part === '..') {
-        cur = fs.nodes[cur].parent ?? cur
+        current = fs.nodes[current].parent ?? current
         continue
       }
-      const v = validateName(part)
-      if (v) return { error: `${cmd}: ${v}` }
-      const ex = childByName(fs, cur, part)
-      if (ex) {
-        if (fs.nodes[ex].type !== 'dir') return { error: `${cmd}: '${part}' não é um diretório` }
-        cur = ex
+
+      const nameError = validateName(part)
+
+      if (nameError) return { error: nameError }
+
+      const existing = childByName(fs, current, part)
+
+      if (existing) {
+        if (fs.nodes[existing].type !== 'dir') {
+          return { error: `'${part}' não é um diretório` }
+        }
+
+        current = existing
       } else {
-        cur = addNode(fs, cur, part, 'dir')
-        created = cur
+        current = addNode(fs, current, part, 'dir')
       }
     }
-    return { id: created ?? cur }
+
+    return { id: current }
   }
-  const { dir, base } = splitPath(arg)
-  const parent = dir === '' ? fs.cwd : resolve(fs, dir)
-  if (!parent) return { error: `${cmd}: não é possível criar '${arg}': Arquivo ou diretório inexistente` }
-  if (fs.nodes[parent].type !== 'dir') return { error: `${cmd}: '${dir}': Não é um diretório` }
-  const v = validateName(base)
-  if (v) return { error: `${cmd}: ${v}` }
-  if (childByName(fs, parent, base)) return { error: `${cmd}: não é possível criar '${arg}': já existe` }
-  return { id: addNode(fs, parent, base, type, size) }
+
+  const { dir, base } = splitPath(path)
+  const parentId = dir === '' ? fs.cwd : resolve(fs, dir)
+
+  if (!parentId) {
+    return { error: `'${path}': arquivo ou diretório inexistente` }
+  }
+
+  const nameError = validateNewName(fs, parentId, base)
+
+  if (nameError) return { error: nameError }
+
+  return { id: addNode(fs, parentId, base, type, size) }
 }
 
-export function runCommand(prev: FsState, input: string): CmdResult {
-  const tokens = tokenize(input.trim())
-  const fs = cloneFs(prev)
+export function runCommand(
+  previous: FsState,
+  input: string,
+): CmdResult {
+  const fs = cloneFs(previous)
   const lines: Line[] = []
   const result: CmdResult = { fs, lines }
-  if (!tokens.length) return result
-  const [cmd, ...rest] = tokens
-  const flags = rest.filter((t) => t.startsWith('-') && t.length > 1)
-  const args = rest.filter((t) => !(t.startsWith('-') && t.length > 1))
 
-  switch (cmd) {
+  const tokens = tokenize(input.trim())
+
+  if (!tokens.length) return result
+
+  const [command, ...rest] = tokens
+
+  const isFlag = (value: string) =>
+    value.startsWith('-') && value.length > 1
+
+  const flags = rest.filter(isFlag)
+  const args = rest.filter((value) => !isFlag(value))
+
+  switch (command) {
     case 'help': {
-      const rows: [string, string][] = [
+      const rows = [
         ['pwd', 'mostra o diretório atual'],
-        ['ls [-l] [dir]', 'lista os filhos de um nó'],
-        ['cd <dir>', 'move o ponteiro atual (.. sobe, ~ home)'],
-        ['mkdir [-p] <nome>', 'cria um nó pasta'],
-        ['touch <nome> [kb]', 'cria um nó folha (arquivo)'],
-        ['rm [-rf] <alvo>', 'remove um nó (e sua subárvore)'],
-        ['mv <origem> <dest>', 'move / renomeia um nó'],
-        ['tree [dir]', 'imprime a subárvore'],
-        ['find <termo>', 'busca nós por nome e destaca no canvas'],
-        ['stat <alvo>', 'inspeciona a estrutura de um nó'],
+        ['ls [-l] [dir]', 'lista entradas em ordem pela AVL'],
+        ['cd <dir>', 'entra em uma pasta; aceita .. e ~'],
+        ['mkdir [-p] <nome>', 'cria pastas e insere entradas na AVL'],
+        ['touch <nome> [kb]', 'cria arquivos e insere entradas na AVL'],
+        ['rm [-rf] <alvo>', 'remove entradas e rebalanceia a AVL'],
+        ['mv <origem> <destino>', 'move ou renomeia uma entrada'],
+        ['tree [dir]', 'mostra a hierarquia de diretórios'],
+        ['find <termo>', 'busca por parte do nome em toda a hierarquia'],
+        ['stat [alvo]', 'mostra dados do nó e da AVL'],
         ['clear', 'limpa o terminal'],
       ]
-      rows.forEach(([c, d]) => lines.push([{ text: c.padEnd(20), tone: 'accent' }, { text: d, tone: 'dim' }]))
+
+      rows.forEach(([name, description]) => {
+        lines.push([
+          { text: name.padEnd(24), tone: 'accent' },
+          { text: description, tone: 'dim' },
+        ])
+      })
+
       break
     }
+
     case 'pwd':
       lines.push([{ text: pathOf(fs, fs.cwd) }])
       break
+
     case 'clear':
       result.clear = true
       break
+
     case 'ls': {
-      const long = flags.some((f) => f.includes('l'))
       const target = args[0] ? resolve(fs, args[0]) : fs.cwd
+
       if (!target) {
-        lines.push(err(`ls: não é possível acessar '${args[0]}': Arquivo ou diretório inexistente`))
+        lines.push(err(`ls: '${args[0]}': caminho inexistente`))
         break
       }
-      const n = fs.nodes[target]
-      const ids = n.type === 'dir' ? n.children : [target]
+
+      const node = fs.nodes[target]
+      const ids = node.type === 'dir' ? node.children : [target]
+
       if (!ids.length) {
         lines.push(dim('(diretório vazio)'))
         break
       }
-      const sorted = [...ids].sort((a, b) => {
-        const x = fs.nodes[a]
-        const y = fs.nodes[b]
-        if (x.type !== y.type) return x.type === 'dir' ? -1 : 1
-        return x.name.localeCompare(y.name)
-      })
+
+      const long = flags.some((flag) => flag.includes('l'))
+
       if (long) {
-        sorted.forEach((id) => {
-          const c = fs.nodes[id]
-          const meta =
-            c.type === 'dir'
-              ? `d  ${String(c.children.length).padStart(2)} filhos `
-              : `-  ${String(c.size).padStart(2)} KB     `
+        ids.forEach((id) => {
+          const child = fs.nodes[id]
+
+          const metadata =
+            child.type === 'dir'
+              ? `d  ${child.children.length} entradas  `
+              : `-  ${child.size} KB  `
+
           lines.push([
-            { text: meta, tone: 'dim' },
-            { text: c.type === 'dir' ? c.name + '/' : c.name, tone: c.type },
+            { text: metadata, tone: 'dim' },
+            {
+              text: child.name + (child.type === 'dir' ? '/' : ''),
+              tone: child.type,
+            },
           ])
         })
       } else {
         const line: Line = []
-        sorted.forEach((id) => {
-          const c = fs.nodes[id]
-          line.push({ text: c.type === 'dir' ? c.name + '/' : c.name, tone: c.type })
+
+        ids.forEach((id) => {
+          const child = fs.nodes[id]
+
+          line.push({
+            text: child.name + (child.type === 'dir' ? '/' : ''),
+            tone: child.type,
+          })
+
           line.push({ text: '  ' })
         })
+
         lines.push(line)
       }
+
       break
     }
+
     case 'cd': {
-      const t = args[0] ? resolve(fs, args[0]) : (homeId(fs) ?? fs.root)
-      if (!t) lines.push(err(`cd: ${args[0]}: Arquivo ou diretório inexistente`))
-      else if (fs.nodes[t].type !== 'dir') lines.push(err(`cd: ${args[0]}: Não é um diretório`))
-      else {
-        fs.cwd = t
-        result.select = t
+      const target = args[0]
+        ? resolve(fs, args[0])
+        : (homeId(fs) ?? fs.root)
+
+      if (!target) {
+        lines.push(err(`cd: '${args[0]}': caminho inexistente`))
+      } else if (fs.nodes[target].type !== 'dir') {
+        lines.push(err(`cd: '${args[0]}': não é um diretório`))
+      } else {
+        fs.cwd = target
+        result.select = target
       }
+
       break
     }
+
     case 'mkdir': {
       if (!args.length) {
         lines.push(err('mkdir: operando ausente'))
         break
       }
-      const parents = flags.some((f) => f.includes('p'))
-      for (const a of args) {
-        const r = createAt(fs, a, 'dir', 0, parents, 'mkdir')
-        if (r.error) lines.push(err(r.error))
-        else result.select = r.id
+
+      const parents = flags.some((flag) => flag.includes('p'))
+
+      for (const path of args) {
+        const created = createAt(fs, path, 'dir', 0, parents)
+
+        if (created.error) {
+          lines.push(err(`mkdir: ${created.error}`))
+        } else {
+          result.select = created.id
+        }
       }
+
       break
     }
+
     case 'touch': {
       if (!args.length) {
-        lines.push(err('touch: operando de arquivo ausente'))
+        lines.push(err('touch: operando ausente'))
         break
       }
+
       let names = args
       let size = 1
+      let explicitSize = false
+
       if (args.length >= 2 && /^\d+$/.test(args[args.length - 1])) {
-        size = Math.min(parseInt(args[args.length - 1], 10), 99999)
+        size = Math.min(Number(args[args.length - 1]), 99999)
         names = args.slice(0, -1)
+        explicitSize = true
       }
-      for (const a of names) {
-        const ex = resolve(fs, a)
-        if (ex) {
-          if (fs.nodes[ex].type === 'file') {
-            if (names !== args) fs.nodes[ex].size = size
-            lines.push(dim(`touch: '${a}' já existe (atualizado)`))
-            result.select = ex
-          } else lines.push(err(`touch: '${a}' é um diretório`))
+
+      for (const path of names) {
+        const existing = resolve(fs, path)
+
+        if (existing) {
+          const node = fs.nodes[existing]
+
+          if (node.type !== 'file') {
+            lines.push(err(`touch: '${path}' é um diretório`))
+          } else {
+            if (explicitSize) node.size = size
+
+            result.select = existing
+            lines.push(dim(`touch: '${path}' já existe (atualizado)`))
+          }
+
           continue
         }
-        const r = createAt(fs, a, 'file', size, false, 'touch')
-        if (r.error) lines.push(err(r.error))
-        else result.select = r.id
+
+        const created = createAt(fs, path, 'file', size, false)
+
+        if (created.error) {
+          lines.push(err(`touch: ${created.error}`))
+        } else {
+          result.select = created.id
+        }
       }
+
       break
     }
+
     case 'rm': {
-      const recursive = flags.some((f) => /[rR]/.test(f))
-      const force = flags.some((f) => f.includes('f'))
       if (!args.length) {
         lines.push(err('rm: operando ausente'))
         break
       }
-      for (const a of args) {
-        if (resolve(fs, a) === fs.root && splitPath(a).base !== '*') {
-          lines.push(err("rm: é perigoso operar recursivamente em '/' (preserve-root)"))
+
+      const recursive = flags.some((flag) => /[rR]/.test(flag))
+      const force = flags.some((flag) => flag.includes('f'))
+
+      for (const path of args) {
+        if (resolve(fs, path) === fs.root) {
+          lines.push(err("rm: não é permitido remover a raiz '/'"))
           continue
         }
-        const targets = expandTargets(fs, a)
+
+        const targets = expandTargets(fs, path)
+
         if (!targets.length) {
-          if (!force) lines.push(err(`rm: não é possível remover '${a}': Arquivo ou diretório inexistente`))
+          if (!force) {
+            lines.push(err(`rm: '${path}': caminho inexistente`))
+          }
+
           continue
         }
+
         let count = 0
         let kb = 0
+
         for (const id of targets) {
-          if (!fs.nodes[id] || id === fs.root) continue
-          if (fs.nodes[id].type === 'dir' && !recursive) {
-            lines.push(err(`rm: não é possível remover '${fs.nodes[id].name}': É um diretório (use -r)`))
+          const node = fs.nodes[id]
+
+          if (!node || id === fs.root) continue
+
+          if (node.type === 'dir' && !recursive) {
+            lines.push(err(`rm: '${node.name}' é um diretório; use -r`))
             continue
           }
-          const r = removeSubtree(fs, id)
-          count += r.count
-          kb += r.kb
+
+          const removed = removeSubtree(fs, id)
+          count += removed.count
+          kb += removed.kb
         }
-        if (count > 1) lines.push(dim(`${count} nós liberados · ${kb} KB`))
+
+        if (count > 1) {
+          lines.push(dim(`${count} nós removidos · ${kb} KB estimados`))
+        }
       }
+
       break
     }
+
     case 'mv': {
-      if (args.length < 2) {
+      if (args.length !== 2) {
         lines.push(err('mv: uso: mv <origem> <destino>'))
         break
       }
-      const src = resolve(fs, args[0])
-      if (!src) {
-        lines.push(err(`mv: '${args[0]}': Arquivo ou diretório inexistente`))
+
+      const source = resolve(fs, args[0])
+
+      if (!source) {
+        lines.push(err(`mv: '${args[0]}': caminho inexistente`))
         break
       }
-      if (src === fs.root) {
-        lines.push(err("mv: não é possível mover '/'"))
+
+      if (source === fs.root) {
+        lines.push(err("mv: não é permitido mover a raiz '/'"))
         break
       }
-      const dst = resolve(fs, args[1])
+
+      const destination = resolve(fs, args[1])
+      const node = fs.nodes[source]
+
       let newParent: string
       let newName: string
-      if (dst && fs.nodes[dst].type === 'dir') {
-        newParent = dst
-        newName = fs.nodes[src].name
-      } else if (dst) {
+
+      if (destination && fs.nodes[destination].type === 'dir') {
+        newParent = destination
+        newName = node.name
+      } else if (destination) {
+        if (destination === source) {
+          result.select = source
+          break
+        }
+
         lines.push(err(`mv: '${args[1]}' já existe`))
         break
       } else {
         const { dir, base } = splitPath(args[1])
-        const p = dir === '' ? fs.cwd : resolve(fs, dir)
-        if (!p || fs.nodes[p].type !== 'dir') {
+        const parentId = dir === '' ? fs.cwd : resolve(fs, dir)
+
+        if (!parentId || fs.nodes[parentId].type !== 'dir') {
           lines.push(err(`mv: destino '${args[1]}' inválido`))
           break
         }
-        newParent = p
+
+        newParent = parentId
         newName = base
       }
-      const v = validateName(newName)
-      if (v) {
-        lines.push(err(`mv: ${v}`))
+
+      const nameError = validateName(newName)
+
+      if (nameError) {
+        lines.push(err(`mv: ${nameError}`))
         break
       }
-      if (isAncestor(fs, src, newParent)) {
-        lines.push(err('mv: não é possível mover um nó para dentro de si mesmo (ciclo)'))
+
+      if (ancestors(fs, newParent).includes(source)) {
+        lines.push(err('mv: não é possível mover uma pasta para dentro de si mesma'))
         break
       }
-      const clash = childByName(fs, newParent, newName)
-      if (clash && clash !== src) {
+
+      const duplicate = childByName(fs, newParent, newName)
+
+      if (duplicate && duplicate !== source) {
         lines.push(err(`mv: '${newName}' já existe no destino`))
         break
       }
-      const node = fs.nodes[src]
-      const old = fs.nodes[node.parent!]
-      old.children = old.children.filter((c) => c !== src)
-      fs.nodes[newParent].children.push(src)
-      node.parent = newParent
-      node.name = newName
-      result.select = src
-      break
-    }
-    case 'tree': {
-      const t = args[0] ? resolve(fs, args[0]) : fs.cwd
-      if (!t) {
-        lines.push(err(`tree: '${args[0]}': Arquivo ou diretório inexistente`))
+
+      if (node.parent === newParent && node.name === newName) {
+        result.select = source
         break
       }
-      lines.push([{ text: t === fs.root ? '/' : fs.nodes[t].name, tone: fs.nodes[t].type }])
-      const walk = (id: string, prefix: string) => {
-        const kids = fs.nodes[id].children
-        kids.forEach((k, i) => {
-          const last = i === kids.length - 1
-          const n = fs.nodes[k]
-          lines.push([
-            { text: prefix + (last ? '└── ' : '├── '), tone: 'dim' },
-            { text: n.name, tone: n.type },
-          ])
-          walk(k, prefix + (last ? '    ' : '│   '))
-        })
-      }
-      walk(t, '')
-      const s = listDfs(fs, t).length
-      lines.push(dim(`${s} nós`))
+
+      // Remove a chave antiga antes de alterar nome e pai.
+      removeEntry(fs, node.parent!, node.name)
+      insertEntry(fs, newParent, newName, source)
+
+      node.parent = newParent
+      node.name = newName
+      result.select = source
+
       break
     }
+
+    case 'tree': {
+      const target = args[0] ? resolve(fs, args[0]) : fs.cwd
+
+      if (!target) {
+        lines.push(err(`tree: '${args[0]}': caminho inexistente`))
+        break
+      }
+
+      lines.push([
+        {
+          text: target === fs.root ? '/' : fs.nodes[target].name,
+          tone: fs.nodes[target].type,
+        },
+      ])
+
+      function visit(id: string, prefix: string): void {
+        const children = childrenOf(fs, id)
+
+        children.forEach((childId, index) => {
+          const last = index === children.length - 1
+          const child = fs.nodes[childId]
+
+          lines.push([
+            { text: prefix + (last ? '└── ' : '├── '), tone: 'dim' },
+            { text: child.name, tone: child.type },
+          ])
+
+          visit(childId, prefix + (last ? '    ' : '│   '))
+        })
+      }
+
+      visit(target, '')
+      lines.push(dim(`${listDfs(fs, target).length} nós`))
+
+      break
+    }
+
     case 'find': {
       const term = args.join(' ')
+
       if (!term) {
         lines.push(err('find: uso: find <termo>'))
         break
       }
-      const hits = findNodes(fs, term)
-      if (!hits.length) lines.push(err(`find: nenhum nó encontrado para '${term}'`))
-      else {
-        hits.forEach((id) => lines.push([{ text: pathOf(fs, id), tone: fs.nodes[id].type }]))
-        lines.push(dim(`${hits.length} resultado(s)`))
-        result.highlight = hits
-        result.select = hits[0]
+
+      const matches = findNodes(fs, term)
+
+      if (!matches.length) {
+        lines.push(err(`find: nenhum resultado para '${term}'`))
+      } else {
+        matches.forEach((id) => {
+          lines.push([
+            { text: pathOf(fs, id), tone: fs.nodes[id].type },
+          ])
+        })
+
+        lines.push(dim(`${matches.length} resultado(s)`))
+        result.highlight = matches
+        result.select = matches[0]
       }
+
       break
     }
+
     case 'stat': {
-      const t = args[0] ? resolve(fs, args[0]) : fs.cwd
-      if (!t) {
-        lines.push(err(`stat: '${args[0]}': Arquivo ou diretório inexistente`))
+      const target = args[0] ? resolve(fs, args[0]) : fs.cwd
+
+      if (!target) {
+        lines.push(err(`stat: '${args[0]}': caminho inexistente`))
         break
       }
-      const n = fs.nodes[t]
-      const row = (k: string, v: string) => lines.push([{ text: k.padEnd(10), tone: 'dim' }, { text: v }])
-      row('ptr', n.id)
-      row('nome', n.name)
-      row('tipo', n.type === 'dir' ? 'pasta' : 'arquivo (folha)')
-      row('parent', n.parent ?? 'NULL')
-      row('filhos', n.type === 'dir' ? String(n.children.length) : 'NULL')
-      if (n.type === 'file') row('tamanho', `${n.size} KB`)
-      result.select = t
+
+      const node = fs.nodes[target]
+
+      const row = (label: string, value: string) => {
+        lines.push([
+          { text: label.padEnd(14), tone: 'dim' },
+          { text: value },
+        ])
+      }
+
+      row('ID', node.id)
+      row('nome', node.name)
+      row('tipo', node.type === 'dir' ? 'pasta' : 'arquivo')
+      row('pai', node.parent ?? 'NULL')
+      row('caminho', pathOf(fs, target))
+
+      if (node.type === 'dir') {
+        row('entradas', String(node.children.length))
+        row('AVL raiz', node.entries?.key ?? 'NULL')
+        row('AVL altura', String(avlHeight(node.entries)))
+        row('AVL FB', String(balanceFactor(node.entries)))
+      } else {
+        row('tamanho', `${node.size} KB`)
+      }
+
+      result.select = target
       break
     }
+
     default:
-      lines.push(err(`bash: ${cmd}: comando não encontrado (digite 'help')`))
+      lines.push(err(`bash: ${command}: comando não encontrado; digite help`))
   }
+
   return result
 }
-/* ------------------------------ sessão inicial ------------------------------ */
 
-export function createInitialSession(): { fs: FsState; history: HistoryEntry[] } {
+export function createInitialSession(): {
+  fs: FsState
+  history: HistoryEntry[]
+} {
   let fs = createFs()
+
   const setup = [
     'mkdir home etc var tmp usr',
     'mkdir -p home/usuario',
@@ -602,7 +1012,11 @@ export function createInitialSession(): { fs: FsState; history: HistoryEntry[] }
     'touch var/app.log 48',
     'touch tmp/cache.bin 6',
   ]
-  for (const c of setup) fs = runCommand(fs, c).fs
+
+  for (const command of setup) {
+    fs = runCommand(fs, command).fs
+  }
+
   const visible = [
     'cd /home/usuario',
     'mkdir projetos',
@@ -613,16 +1027,26 @@ export function createInitialSession(): { fs: FsState; history: HistoryEntry[] }
     'ls',
     'rm temp.txt',
   ]
+
   const history: HistoryEntry[] = [
     {
       id: 0,
-      lines: [dim("memfs 1.0 · árvore N-ária em memória · digite 'help' para ver os comandos")],
+      lines: [
+        dim('memfs · sistema de arquivos com AVL por diretório · digite help'),
+      ],
     },
   ]
-  visible.forEach((cmd, i) => {
-    const r = runCommand(fs, cmd)
-    fs = r.fs
-    history.push({ id: i + 1, cmd, lines: r.lines })
+
+  visible.forEach((command, index) => {
+    const result = runCommand(fs, command)
+    fs = result.fs
+
+    history.push({
+      id: index + 1,
+      cmd: command,
+      lines: result.lines,
+    })
   })
+
   return { fs, history }
 }
